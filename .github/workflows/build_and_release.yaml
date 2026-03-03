@@ -5,57 +5,158 @@ on:
     branches:
       - main
     paths:
-      - 'BuildLog.md'
+      - "BuildLog.md"
   workflow_dispatch:
+    inputs:
+      build_version:
+        description: "Build version type"
+        required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable # Auto-fetch latest stable release tag (e.g. v1.3.17)
+          - latest # Latest commit on main branch (bleeding edge)
+          - custom # Specify a tag manually below
+      custom_tag:
+        description: "Custom tag to build (only used when build_version = custom, e.g. v1.3.16)"
+        required: false
+        default: ""
+        type: string
+      platforms:
+        description: "Platforms to build (comma-separated: windows, linux, macos)"
+        required: true
+        default: "windows,linux,macos"
+        type: string
+
 env:
   BUILD_TYPE: Release
+  SKIA_TAG: m124-08a5439a6b
 
 jobs:
-  fetch-aseprite-info:
-    name: Fetch deps info
+  # ─────────────────────────────────────────────────────────────
+  # 1. Resolve which Aseprite tag / source to build
+  #    + Compute platform matrix
+  #    (merged into one job to avoid extra runner overhead)
+  # ─────────────────────────────────────────────────────────────
+  prepare:
+    name: Prepare build info
     runs-on: ubuntu-latest
     outputs:
-      download-link: ${{ steps.aseprite-link.outputs.download-link }}
-      release-tag: ${{ steps.aseprite-link.outputs.release-tag }}
+      release-tag: ${{ steps.resolve.outputs.release-tag }}
+      download-link: ${{ steps.resolve.outputs.download-link }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Fetch Aseprite release link
-        id: aseprite-link
+      # --- Option A: stable → fetch latest *release* from GitHub API (no pre-releases) ---
+      - name: Fetch latest stable release tag
+        if: ${{ github.event_name == 'push' || inputs.build_version == 'stable' }}
+        id: stable-tag
+        run: |
+          TAG=$(curl -fsSL "https://api.github.com/repos/aseprite/aseprite/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | jq -r '.tag_name')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved stable tag: $TAG"
+
+      # --- Option B: latest → fetch newest release (may include pre-release) ---
+      - name: Fetch latest commit release link
+        if: ${{ inputs.build_version == 'latest' }}
+        id: latest-tag
         uses: a1393323447/fetch-release@main
         with:
-            group: aseprite
-            repo: aseprite
-            match: Aseprite-.*?-Source.zip
+          group: aseprite
+          repo: aseprite
+          match: Aseprite-.*?-Source.zip
 
+      # --- Merge outputs into a single step ---
+      - name: Resolve final tag & download link
+        id: resolve
+        run: |
+          VERSION="${{ inputs.build_version }}"
+          PUSH_EVENT="${{ github.event_name }}"
+
+          if [[ "$PUSH_EVENT" == "push" || "$VERSION" == "stable" ]]; then
+            TAG="${{ steps.stable-tag.outputs.tag }}"
+            LINK="https://github.com/aseprite/aseprite/releases/download/$TAG/Aseprite-$TAG-Source.zip"
+
+          elif [[ "$VERSION" == "custom" ]]; then
+            TAG="${{ inputs.custom_tag }}"
+            if [[ -z "$TAG" ]]; then
+              echo "::error::custom_tag must be set when build_version is 'custom'"
+              exit 1
+            fi
+            LINK="https://github.com/aseprite/aseprite/releases/download/$TAG/Aseprite-$TAG-Source.zip"
+
+          else
+            # latest (via fetch-release action)
+            TAG="${{ steps.latest-tag.outputs.release-tag }}"
+            LINK="${{ steps.latest-tag.outputs.download-link }}"
+          fi
+
+          echo "release-tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "download-link=$LINK" >> "$GITHUB_OUTPUT"
+          echo "Final tag: $TAG"
+          echo "Download link: $LINK"
+
+      # --- Compute platform matrix (merged here to avoid a separate job) ---
+      - name: Compute platform matrix
+        id: set-matrix
+        run: |
+          # On push events, always build all platforms
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            PLATFORMS="windows,linux,macos"
+          else
+            PLATFORMS="${{ inputs.platforms }}"
+          fi
+
+          INCLUDES='[]'
+          if [[ "$PLATFORMS" == *"windows"* ]]; then
+            INCLUDES=$(echo "$INCLUDES" | jq -c '. += [{"os":"windows-latest"}]')
+          fi
+          if [[ "$PLATFORMS" == *"linux"* ]]; then
+            INCLUDES=$(echo "$INCLUDES" | jq -c '. += [{"os":"ubuntu-latest"}]')
+          fi
+          if [[ "$PLATFORMS" == *"macos"* ]]; then
+            INCLUDES=$(echo "$INCLUDES" | jq -c '. += [{"os":"macos-latest"}]')
+          fi
+
+          MATRIX=$(echo "{\"include\":$INCLUDES}" | jq -c .)
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Computed matrix: $MATRIX"
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. Create the GitHub Release (skip if already exists)
+  # ─────────────────────────────────────────────────────────────
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: fetch-aseprite-info
+    needs: prepare
     permissions:
       contents: write
-    outputs:
-      download-link: ${{ needs.fetch-aseprite-info.outputs.download-link }}
-      release-tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: ncipollo/release-action@v1
         with:
-          tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
-          body: Aseprite-${{ needs.fetch-aseprite-info.outputs.release-tag }}
+          tag: ${{ needs.prepare.outputs.release-tag }}
+          body: Aseprite-${{ needs.prepare.outputs.release-tag }}
           skipIfReleaseExists: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # ─────────────────────────────────────────────────────────────
+  # 3. Build Aseprite per platform
+  # ─────────────────────────────────────────────────────────────
   build-aseprite:
     name: Build Aseprite
-    needs: create-release
+    needs: [prepare, create-release]
     permissions:
       contents: write
-    runs-on: ${{ matrix.os }}
     strategy:
-        matrix:
-          os: [ windows-latest, ubuntu-latest, macOS-latest ]
-        fail-fast: false
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Install Dependencies
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
         if: runner.os == 'Linux'
         shell: bash
         run: |
@@ -64,72 +165,127 @@ jobs:
             libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
             libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
             libfontconfig1-dev
-      - uses: actions/checkout@v4
-      - name: Install Aseprite
+
+      # ── Aseprite source cache ──────────────────────────────────
+      # Key is tag-only (no OS) because source code is platform-independent.
+      # The cache does NOT include the skia/ subdirectory (see .gitignore-style
+      # path below) so it won't conflict with the Skia cache.
+      - name: Cache Aseprite source
+        id: cache-aseprite
+        uses: actions/cache@v4
+        with:
+          path: |
+            aseprite
+            !aseprite/skia
+          key: aseprite-src-${{ needs.prepare.outputs.release-tag }}
+
+      - name: Clone Aseprite source
+        if: steps.cache-aseprite.outputs.cache-hit != 'true'
         shell: bash
         run: |
-          git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.create-release.outputs.release-tag }}
+          git clone --recurse-submodules -j8 \
+            https://github.com/aseprite/aseprite \
+            --branch ${{ needs.prepare.outputs.release-tag }}
+
+      # Fix: use a pattern that matches any version string (including already-patched ones)
+      # so re-running on a cached source won't silently skip the patch.
+      - name: Patch Aseprite version string
+        shell: bash
+        run: |
+          ASEPRITE_VERSION="${{ needs.prepare.outputs.release-tag }}"
+          ASEPRITE_VERSION="${ASEPRITE_VERSION#v}"
+          sed -i "s/set(VERSION \"[^\"]*\")/set(VERSION \"$ASEPRITE_VERSION\")/" \
+            aseprite/src/ver/CMakeLists.txt
+          echo "Patched version: $(grep 'set(VERSION' aseprite/src/ver/CMakeLists.txt)"
+
+      # ── Skia cache ────────────────────────────────────────────
+      # Key includes OS because Skia binaries are platform-specific.
+      # Path is aseprite/skia which is excluded from the source cache above.
+      - name: Cache Skia
+        id: cache-skia
+        uses: actions/cache@v4
+        with:
+          path: aseprite/skia
+          key: skia-${{ env.SKIA_TAG }}-${{ runner.os }}
+
       - name: Install Skia
+        if: steps.cache-skia.outputs.cache-hit != 'true'
         working-directory: aseprite
         shell: bash
         run: |
-          if [[ "${{ runner.os }}" == "Windows" ]] ; then
-            choco install wget -y --no-progress
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
-            unzip Skia-Windows-Release-x64.zip -d skia
-          elif [[ "${{ runner.os }}" == "macOS" ]] ; then
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-macOS-Release-arm64.zip
-            unzip Skia-macOS-Release-arm64.zip -d skia
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            curl -fsSL -o skia.zip \
+              "https://github.com/aseprite/skia/releases/download/${{ env.SKIA_TAG }}/Skia-Windows-Release-x64.zip"
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            curl -fsSL -o skia.zip \
+              "https://github.com/aseprite/skia/releases/download/${{ env.SKIA_TAG }}/Skia-macOS-Release-arm64.zip"
           else
-            wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
-            unzip Skia-Linux-Release-x64.zip -d skia
+            curl -fsSL -o skia.zip \
+              "https://github.com/aseprite/skia/releases/download/${{ env.SKIA_TAG }}/Skia-Linux-Release-x64.zip"
           fi
+          unzip -q skia.zip -d skia
+          rm skia.zip
+
       - uses: aseprite/get-ninja@main
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
-      - name: Generating Makefiles
+
+      # ── ccache ────────────────────────────────────────────────
+      # restore-keys lets a new Aseprite version reuse object files
+      # from the previous version's cache (most C++ files don't change).
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ needs.prepare.outputs.release-tag }}-${{ runner.os }}
+          restore-keys: ccache-
+          max-size: 500M
+
+      - name: Generate Makefiles
         shell: bash
         working-directory: aseprite
         run: |
-          export enable_ccache=off
-          export laf_backend=skia
-          export enable_scripting=on
-
-          if [[ "${{ runner.os }}" == "macOS" ]] ; then
-            export skia_arch=arm64
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            skia_arch=arm64
           else
-            export skia_arch=x64
+            skia_arch=x64
           fi
 
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
             -DENABLE_TESTS=OFF \
-            -DENABLE_SCRIPTING=$enable_scripting \
-            -DENABLE_CCACHE=$enable_ccache \
-            -DLAF_BACKEND=$laf_backend \
+            -DENABLE_SCRIPTING=on \
+            -DENABLE_CCACHE=on \
+            -DLAF_BACKEND=skia \
             -DSKIA_DIR=$(realpath skia) \
             -DOPENSSL_USE_STATIC_LIBS=ON \
             -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
-      - name: Compiling
+
+      - name: Compile
         shell: bash
-        working-directory: aseprite
-        run: |
-          cd build && ninja
-      - name: Clean Up Build folder
+        working-directory: aseprite/build
+        run: ninja
+
+      - name: Clean up build folder
         working-directory: aseprite/build/bin
         shell: bash
         run: find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune -o -name 'Aseprite.app' -prune \) -exec rm -rf {} +
+
       - name: Make portable zip
         working-directory: aseprite/build/bin
+        shell: bash
         run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
-      - name: Create release
+
+      - name: Create release archive
         working-directory: aseprite/build/bin
-        run: 7z -tzip a Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
-      - name: Upload release
+        shell: bash
+        run: 7z -tzip a Aseprite-${{ needs.prepare.outputs.release-tag }}-${{ runner.os }}.zip *
+
+      - name: Upload release asset
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: aseprite/build/bin/Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip
-          asset_name: Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip
-          tag: ${{ needs.create-release.outputs.release-tag }}
+          file: aseprite/build/bin/Aseprite-${{ needs.prepare.outputs.release-tag }}-${{ runner.os }}.zip
+          asset_name: Aseprite-${{ needs.prepare.outputs.release-tag }}-${{ runner.os }}.zip
+          tag: ${{ needs.prepare.outputs.release-tag }}
+          overwrite: true
