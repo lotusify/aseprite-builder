@@ -5,27 +5,97 @@ on:
     branches:
       - main
     paths:
-      - 'BuildLog.md'
+      - "BuildLog.md"
   workflow_dispatch:
+    inputs:
+      build_version:
+        description: "Build version type"
+        required: true
+        default: "stable"
+        type: choice
+        options:
+          - stable # Auto-fetch latest stable release tag (e.g. v1.3.17)
+          - latest # Latest commit on main branch (bleeding edge)
+          - custom # Specify a tag manually below
+      custom_tag:
+        description: "Custom tag to build (only used when build_version = custom, e.g. v1.3.16)"
+        required: false
+        default: ""
+        type: string
+      platforms:
+        description: "Platforms to build (comma-separated: windows, linux, macos)"
+        required: true
+        default: "windows,linux,macos"
+        type: string
+
 env:
   BUILD_TYPE: Release
 
 jobs:
+  # ─────────────────────────────────────────────────────────────
+  # 1. Resolve which Aseprite tag / source to build
+  # ─────────────────────────────────────────────────────────────
   fetch-aseprite-info:
     name: Fetch deps info
     runs-on: ubuntu-latest
     outputs:
-      download-link: ${{ steps.aseprite-link.outputs.download-link }}
-      release-tag: ${{ steps.aseprite-link.outputs.release-tag }}
+      download-link: ${{ steps.resolve.outputs.download-link }}
+      release-tag: ${{ steps.resolve.outputs.release-tag }}
     steps:
-      - name: Fetch Aseprite release link
-        id: aseprite-link
+      # --- Option A: stable → fetch latest *release* from GitHub API (no pre-releases) ---
+      - name: Fetch latest stable release tag
+        if: ${{ github.event_name == 'push' || inputs.build_version == 'stable' }}
+        id: stable-tag
+        run: |
+          TAG=$(curl -fsSL "https://api.github.com/repos/aseprite/aseprite/releases/latest" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | jq -r '.tag_name')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved stable tag: $TAG"
+
+      # --- Option B: latest → fetch newest release (same as before, may include pre-release) ---
+      - name: Fetch latest commit release link
+        if: ${{ inputs.build_version == 'latest' }}
+        id: latest-tag
         uses: a1393323447/fetch-release@main
         with:
-            group: aseprite
-            repo: aseprite
-            match: Aseprite-.*?-Source.zip
+          group: aseprite
+          repo: aseprite
+          match: Aseprite-.*?-Source.zip
 
+      # --- Merge outputs into a single step ---
+      - name: Resolve final tag & download link
+        id: resolve
+        run: |
+          VERSION="${{ inputs.build_version }}"
+          PUSH_EVENT="${{ github.event_name }}"
+
+          if [[ "$PUSH_EVENT" == "push" || "$VERSION" == "stable" ]]; then
+            TAG="${{ steps.stable-tag.outputs.tag }}"
+            LINK="https://github.com/aseprite/aseprite/releases/download/$TAG/Aseprite-$TAG-Source.zip"
+
+          elif [[ "$VERSION" == "custom" ]]; then
+            TAG="${{ inputs.custom_tag }}"
+            if [[ -z "$TAG" ]]; then
+              echo "::error::custom_tag must be set when build_version is 'custom'"
+              exit 1
+            fi
+            LINK="https://github.com/aseprite/aseprite/releases/download/$TAG/Aseprite-$TAG-Source.zip"
+
+          else
+            # latest (via fetch-release action)
+            TAG="${{ steps.latest-tag.outputs.release-tag }}"
+            LINK="${{ steps.latest-tag.outputs.download-link }}"
+          fi
+
+          echo "release-tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "download-link=$LINK" >> "$GITHUB_OUTPUT"
+          echo "Final tag: $TAG"
+          echo "Download link: $LINK"
+
+  # ─────────────────────────────────────────────────────────────
+  # 2. Create the GitHub Release (skip if already exists)
+  # ─────────────────────────────────────────────────────────────
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
@@ -36,7 +106,7 @@ jobs:
       download-link: ${{ needs.fetch-aseprite-info.outputs.download-link }}
       release-tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: ncipollo/release-action@v1
         with:
           tag: ${{ needs.fetch-aseprite-info.outputs.release-tag }}
@@ -44,16 +114,27 @@ jobs:
           skipIfReleaseExists: true
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # ─────────────────────────────────────────────────────────────
+  # 3. Build Aseprite per platform
+  # ─────────────────────────────────────────────────────────────
   build-aseprite:
     name: Build Aseprite
     needs: create-release
     permissions:
       contents: write
-    runs-on: ${{ matrix.os }}
     strategy:
-        matrix:
-          os: [ windows-latest, ubuntu-latest, macOS-latest ]
-        fail-fast: false
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform_key: windows
+          - os: ubuntu-latest
+            platform_key: linux
+          - os: macos-latest
+            platform_key: macos
+    runs-on: ${{ matrix.os }}
+    # Skip platforms not requested by the user
+    if: contains(github.event_name == 'push' && 'windows,linux,macos' || inputs.platforms, matrix.platform_key)
     steps:
       - name: Install Dependencies
         if: runner.os == 'Linux'
@@ -64,11 +145,16 @@ jobs:
             libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
             libx11-dev libxcursor-dev libxi-dev libxrandr-dev libgl1-mesa-dev \
             libfontconfig1-dev
+
       - uses: actions/checkout@v4
-      - name: Install Aseprite
+
+      - name: Clone Aseprite source
         shell: bash
         run: |
-          git clone --recurse-submodules -j8 https://github.com/aseprite/aseprite --branch ${{ needs.create-release.outputs.release-tag }}
+          git clone --recurse-submodules -j8 \
+            https://github.com/aseprite/aseprite \
+            --branch ${{ needs.create-release.outputs.release-tag }}
+
       - name: Install Skia
         working-directory: aseprite
         shell: bash
@@ -84,10 +170,12 @@ jobs:
             wget https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
             unzip Skia-Linux-Release-x64.zip -d skia
           fi
+
       - uses: aseprite/get-ninja@main
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
-      - name: Generating Makefiles
+
+      - name: Generate Makefiles
         shell: bash
         working-directory: aseprite
         run: |
@@ -102,7 +190,7 @@ jobs:
           fi
 
           cmake -S . -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=10.9 \
             -DENABLE_TESTS=OFF \
             -DENABLE_SCRIPTING=$enable_scripting \
@@ -111,22 +199,26 @@ jobs:
             -DSKIA_DIR=$(realpath skia) \
             -DOPENSSL_USE_STATIC_LIBS=ON \
             -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch)
-      - name: Compiling
+
+      - name: Compile
         shell: bash
         working-directory: aseprite
-        run: |
-          cd build && ninja
-      - name: Clean Up Build folder
+        run: cd build && ninja
+
+      - name: Clean up build folder
         working-directory: aseprite/build/bin
         shell: bash
         run: find . -mindepth 1 ! \( -name 'aseprite' -o -name 'aseprite.exe' -o -name 'data' -prune -o -name 'Aseprite.app' -prune \) -exec rm -rf {} +
+
       - name: Make portable zip
         working-directory: aseprite/build/bin
         run: echo '# This file is here so Aseprite behaves as a portable program' > aseprite.ini
-      - name: Create release
+
+      - name: Create release archive
         working-directory: aseprite/build/bin
         run: 7z -tzip a Aseprite-${{ needs.create-release.outputs.release-tag }}-${{ runner.os }}.zip *
-      - name: Upload release
+
+      - name: Upload release asset
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
