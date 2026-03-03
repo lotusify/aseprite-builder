@@ -115,26 +115,52 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─────────────────────────────────────────────────────────────
-  # 3. Build Aseprite per platform
+  # 3. Compute which platforms to build (dynamic matrix)
+  # ─────────────────────────────────────────────────────────────
+  setup-matrix:
+    name: Setup platform matrix
+    runs-on: ubuntu-latest
+    needs: create-release
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Compute matrix from platform input
+        id: set-matrix
+        run: |
+          # On push events, always build all platforms
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            PLATFORMS="windows,linux,macos"
+          else
+            PLATFORMS="${{ inputs.platforms }}"
+          fi
+
+          INCLUDES='[]'
+          if [[ "$PLATFORMS" == *"windows"* ]]; then
+            INCLUDES=$(echo "$INCLUDES" | jq '. += [{"os":"windows-latest"}]')
+          fi
+          if [[ "$PLATFORMS" == *"linux"* ]]; then
+            INCLUDES=$(echo "$INCLUDES" | jq '. += [{"os":"ubuntu-latest"}]')
+          fi
+          if [[ "$PLATFORMS" == *"macos"* ]]; then
+            INCLUDES=$(echo "$INCLUDES" | jq '. += [{"os":"macos-latest"}]')
+          fi
+
+          MATRIX="{\"include\":$INCLUDES}"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Computed matrix: $MATRIX"
+
+  # ─────────────────────────────────────────────────────────────
+  # 4. Build Aseprite per platform
   # ─────────────────────────────────────────────────────────────
   build-aseprite:
     name: Build Aseprite
-    needs: create-release
+    needs: [create-release, setup-matrix]
     permissions:
       contents: write
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            platform_key: windows
-          - os: ubuntu-latest
-            platform_key: linux
-          - os: macos-latest
-            platform_key: macos
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
-    # Skip platforms not requested by the user
-    if: contains(github.event_name == 'push' && 'windows,linux,macos' || inputs.platforms, matrix.platform_key)
     steps:
       - name: Install Dependencies
         if: runner.os == 'Linux'
